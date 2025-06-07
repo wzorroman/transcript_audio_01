@@ -1,5 +1,6 @@
 import os
 from pydub import AudioSegment
+import torch
 import whisper
 from datetime import timedelta
 from concurrent.futures import ProcessPoolExecutor
@@ -142,18 +143,32 @@ def load_chunks_from_folder(chunk_dir: str = "chunks", extension: str = ".wav") 
     logger.info(f"✅ Se encontraron {len(chunk_files)} chunks en '{chunk_dir}'.")
     return chunk_files
 
+@log_decorator()
 def transcribe_single_chunk(args):
     """
     Función auxiliar para transcribir un único chunk.
     Diseñada para ser usada en paralelo.
     """
-    chunk_path, model_size, language, output_dir = args
+    chunk_path, model_size, language, output_dir, device = args
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Configurar opciones de transcripción
+    transcribe_options = {
+        "language": language,
+        "fp16": False if device == "cpu" else True  # FP16 solo para GPU
+    }
     try:
-        model = whisper.load_model(model_size)
+        model = whisper.load_model(model_size, device=device)        
+    except Exception as e:
+        logger.warning(f"Error al cargar modelo {chunk_path}: {e}")    
+    
+    try:
         logger.info(f" * Transcribiendo: {chunk_path}")
-        result = model.transcribe(chunk_path, language=language)
+        #result = model.transcribe(chunk_path, language=language)
+        result = model.transcribe(chunk_path, **transcribe_options)
         text = result["text"]
-        
+        logger.info(f" *   transcripcion => cant caracteres: {len(text)}")
         # Generar nombre del archivo de salida
         filename = os.path.splitext(os.path.basename(chunk_path))[0] + ".txt"
         output_path = os.path.join(output_dir, filename)
@@ -161,39 +176,11 @@ def transcribe_single_chunk(args):
         # Guardar texto
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(text)
-
+        logger.info(f" * Transcripcion finalizada: {chunk_path} | {output_path}")
         return output_path  # Devolver la ruta del archivo guardado
     except Exception as e:
         logger.warning(f"Error al transcribir {chunk_path}: {e}")
         return None
-
-def transcribe_chunks_parallel(chunks: list, model_size: str = "medium", language: str = "es", max_workers: int = None) -> list:
-    """
-    Transcribe una lista de chunks en paralelo usando multiprocessing.
-    
-    Args:
-        chunks (list): Lista de rutas de archivos WAV.
-        model_size (str): Tamaño del modelo Whisper a usar.
-        language (str): Idioma del audio (ej: 'es', 'en').
-        max_workers (int): Cantidad máxima de procesos simultáneos.
-
-    Returns:
-        list: Lista con las transcripciones de cada chunk.
-    """
-    if not chunks:
-        logger.warning("No hay chunks para transcribir.")
-        return []
-
-    num_processes = max_workers or min(1, os.cpu_count())  # Ajusta según tu CPU
-    logger.info(f"Iniciando transcripción paralela con {num_processes} procesos...")
-
-    args_list = [(chunk, model_size, language) for chunk in chunks]
-
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
-        results = list(executor.map(transcribe_single_chunk, args_list))
-
-    logger.info("✅ Transcripción paralela completada.")
-    return results
 
 def get_unprocessed_chunks(chunks: list, output_dir: str = "trans_chunks") -> list:
     unprocessed = []
@@ -202,13 +189,18 @@ def get_unprocessed_chunks(chunks: list, output_dir: str = "trans_chunks") -> li
         output_path = os.path.join(output_dir, base_name)
         if not os.path.exists(output_path):
             unprocessed.append(chunk)
+        else:
+            logger.info(f"chunk ya procesado anteriormente : {chunk}")
+            continue
+        
     return unprocessed
 
 def transcribe_chunks_parallel_and_save(
     chunks: list,
     output_dir: str = "transcripcion_chunks",
-    model_size: str = "medium",
+    model_size: str = "base",
     language: str = "es",
+    device: str = "cpu",
     max_workers: int = None
 ) -> list:
     """
@@ -228,7 +220,7 @@ def transcribe_chunks_parallel_and_save(
     num_processes = max_workers or min(4, os.cpu_count())
 
     logger.info(f"Iniciando transcripción paralela con {num_processes} procesos...")
-    args_list = [(chunk, model_size, language, output_dir) for chunk in chunks]
+    args_list = [(chunk, model_size, language, output_dir, device) for chunk in chunks]
 
     with ProcessPoolExecutor(max_workers=num_processes) as executor:
         saved_files = list(executor.map(transcribe_single_chunk, args_list))
@@ -268,14 +260,17 @@ def main_v1():
     output_file_txt = "outputs/transcripcion.txt"
     output_dir_chunks = "outputs/chunks"
     
-    CHUNKS_LENGTH_SIZE = 300000 # Segmentos de 5 minutos    
+    split_in_min = 1
+    CHUNKS_LENGTH_SIZE = int(split_in_min * 60 * 1000)  # minutos → segundos → ms
+    # CHUNKS_LENGTH_SIZE = 300000 # Segmentos de 5 minutos
+    
     wav_file = convert_mp3_to_wav(input_file, output_file_wav)
     chunks = split_audio(wav_file, chunk_length_ms=CHUNKS_LENGTH_SIZE, output_dir=output_dir_chunks)
-    transcriptions = transcribe_chunks(chunks, model_size="medium", language="es")
-    save_transcription(transcriptions, output_file_txt)
+    # transcriptions = transcribe_chunks(chunks, model_size="medium", language="es")
+    # save_transcription(transcriptions, output_file_txt)
 
 @log_decorator()
-def main():
+def main_v2():
     # procesa desde los chunks ya almacenados en una carpeta
     output_dir_chunks = "outputs/chunks"
     output_dir_transcriptions = "outputs/transcriptions"
@@ -284,12 +279,13 @@ def main():
     # verificar los chunks ya procesados
     chunks = get_unprocessed_chunks(chunks)
     # 👇 Transcribir y guardar cada chunk individualmente
+    # model_size_opc = tiny, base o medium
     saved_files = transcribe_chunks_parallel_and_save(
         chunks,
         output_dir=output_dir_transcriptions,
-        model_size="medium",
+        model_size="tiny",
         language="es",
-        max_workers=4
+        max_workers=2
     )
 
     # 👇 Unir todas las transcripciones en un solo archivo
@@ -297,5 +293,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main_v2()
     
