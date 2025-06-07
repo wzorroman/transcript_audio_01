@@ -1,9 +1,11 @@
 import os
 from pydub import AudioSegment
 import torch
-import whisper
+import time
+from faster_whisper import WhisperModel
 from datetime import timedelta
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 import sys
 from pathlib import Path
@@ -143,13 +145,17 @@ def load_chunks_from_folder(chunk_dir: str = "chunks", extension: str = ".wav") 
     logger.info(f"✅ Se encontraron {len(chunk_files)} chunks en '{chunk_dir}'.")
     return chunk_files
 
+def get_chunk_duration_ms(chunk_path):
+    audio = AudioSegment.from_wav(chunk_path)
+    return len(audio)
+
 @log_decorator()
-def transcribe_single_chunk(args):
+def transcribe_single_chunk_with_model2(args):
     """
     Función auxiliar para transcribir un único chunk.
     Diseñada para ser usada en paralelo.
     """
-    chunk_path, model_size, language, output_dir, device = args
+    chunk_path, model, language, output_dir, device = args
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -158,14 +164,12 @@ def transcribe_single_chunk(args):
         "language": language,
         "fp16": False if device == "cpu" else True  # FP16 solo para GPU
     }
-    try:
-        model = whisper.load_model(model_size, device=device)        
-    except Exception as e:
-        logger.warning(f"Error al cargar modelo {chunk_path}: {e}")    
-    
+    logger.info(f" OPC transcripcion => {transcribe_options}")
+    logger.info(f"Chunk {chunk_path} - Duración: {get_chunk_duration_ms(chunk_path)} ms")
     try:
         logger.info(f" * Transcribiendo: {chunk_path}")
         #result = model.transcribe(chunk_path, language=language)
+        time.sleep(1)
         result = model.transcribe(chunk_path, **transcribe_options)
         text = result["text"]
         logger.info(f" *   transcripcion => cant caracteres: {len(text)}")
@@ -182,19 +186,42 @@ def transcribe_single_chunk(args):
         logger.warning(f"Error al transcribir {chunk_path}: {e}")
         return None
 
-def get_unprocessed_chunks(chunks: list, output_dir: str = "trans_chunks") -> list:
-    unprocessed = []
-    for chunk in chunks:
-        base_name = os.path.splitext(os.path.basename(chunk))[0] + ".txt"
-        output_path = os.path.join(output_dir, base_name)
-        if not os.path.exists(output_path):
-            unprocessed.append(chunk)
-        else:
-            logger.info(f"chunk ya procesado anteriormente : {chunk}")
-            continue
-        
-    return unprocessed
+def transcribe_single_chunk_with_model(
+    chunk_path, 
+    model, 
+    output_dir, 
+    options,
+    max_retries: int = 3,
+    retry_delay: float = 1.0
+):
+    """
+    Transcribe un único chunk reutilizando un modelo ya cargado.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f" * Transcribiendo: {chunk_path}")
+            segments, info = model.transcribe(chunk_path, **options)
+            full_text = " ".join(segment.text for segment in segments)
+            logger.info(f" *   transcripcion => cant caracteres: {len(full_text)}")
 
+            filename = os.path.splitext(os.path.basename(chunk_path))[0] + ".txt"
+            output_path = os.path.join(output_dir, filename)
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(full_text.strip())
+
+            logger.info(f" * Transcripcion finalizada: {chunk_path} | {output_path}")
+            return output_path
+
+        except Exception as e:
+            logger.warning(f"❌ Error en intento {attempt} al transcribir {chunk_path}: {e}", exc_info=True)
+            if attempt < max_retries:
+                logger.info(f"🔄 Reintentando en {retry_delay} segundos...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"🛑 Chunk fallido tras {max_retries} intentos: {chunk_path}")
+                return None
+    
 def transcribe_chunks_parallel_and_save(
     chunks: list,
     output_dir: str = "transcripcion_chunks",
@@ -217,18 +244,52 @@ def transcribe_chunks_parallel_and_save(
         list: Lista de rutas de archivos de transcripciones guardados.
     """
     os.makedirs(output_dir, exist_ok=True)
-    num_processes = max_workers or min(4, os.cpu_count())
+    # num_processes = max_workers or min(4, os.cpu_count())
+    num_threads = max_workers or min(4, os.cpu_count())
 
-    logger.info(f"Iniciando transcripción paralela con {num_processes} procesos...")
-    args_list = [(chunk, model_size, language, output_dir, device) for chunk in chunks]
+    try:
+        start_load = time.time()
+        model = WhisperModel(model_size, device=device, compute_type="float16" if device == "cuda" else "int8")
+        print(f"({device}) Modelo [{model_size}] cargado: {time.time() - start_load:.2f} seg")    
+    except Exception as e:
+        logger.warning(f"Error al cargar modelo: {e}")
+        return []
+        
+    logger.info(f"Iniciando transcripción paralela con {num_threads} procesos...")
+    
+    # Configurar opciones comunes de transcripción
+    transcribe_options = {
+        "language": language,
+        "without_timestamps": True,
+        "max_new_tokens": 128,
+        "beam_size": 5
+    }
+    
+    # Función auxiliar que recibe solo el chunk
+    def wrapper(chunk):
+        return transcribe_single_chunk_with_model(chunk, model, output_dir, transcribe_options)
 
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
-        saved_files = list(executor.map(transcribe_single_chunk, args_list))
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        saved_files = list(executor.map(wrapper, chunks))
 
     # Filtrar resultados nulos (chunks que fallaron)
     saved_files = [f for f in saved_files if f is not None]
     logger.info(f"✅ Se guardaron {len(saved_files)} transcripciones individuales.")
     return saved_files
+
+
+def get_unprocessed_chunks(chunks: list, output_dir: str = "trans_chunks") -> list:
+    unprocessed = []
+    for chunk in chunks:
+        base_name = os.path.splitext(os.path.basename(chunk))[0] + ".txt"
+        output_path = os.path.join(output_dir, base_name)
+        if not os.path.exists(output_path):
+            unprocessed.append(chunk)
+        else:
+            logger.info(f"chunk ya procesado anteriormente : {chunk}")
+            continue
+        
+    return unprocessed
 
 
 def merge_transcriptions(file_paths: list, output_file: str = "transcripcion_completa.txt"):
@@ -242,7 +303,7 @@ def merge_transcriptions(file_paths: list, output_file: str = "transcripcion_com
             for idx, file_path in enumerate(sorted(file_paths)):
                 with open(file_path, "r", encoding="utf-8") as infile:
                     content = infile.read()
-                    outfile.write(f"\n--- Segmento {idx+1} ---\n")
+                    #outfile.write(f"\n--- Segmento {idx+1} ---\n")
                     outfile.write(content + "\n")
         logger.info(f"✅ Transcripción completa guardada en '{output_file}'")
     except Exception as e:
@@ -272,7 +333,7 @@ def main_v1():
 @log_decorator()
 def main_v2():
     # procesa desde los chunks ya almacenados en una carpeta
-    output_dir_chunks = "outputs/chunks"
+    output_dir_chunks = "outputs/chunks_min_2"
     output_dir_transcriptions = "outputs/transcriptions"
     
     chunks = load_chunks_from_folder(output_dir_chunks)
